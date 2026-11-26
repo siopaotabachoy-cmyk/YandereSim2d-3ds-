@@ -1,0 +1,81 @@
+name: Build CIA
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get template Makefile and enable citro2d
+        run: |
+          git clone --depth 1 https://github.com/devkitPro/3ds-examples /tmp/ex
+          cp /tmp/ex/templates/application/Makefile Makefile
+          sed -i 's/^LIBS[[:space:]]*:=.*/LIBS := -lcitro2d -lcitro3d -lctru -lm/' Makefile
+
+      - name: Build .elf/.3dsx/.smdh with devkitARM
+        run: |
+          docker run --rm -v "$PWD":/work -w /work devkitpro/devkitarm \
+            make TARGET=yandereschool
+
+      - name: Download makerom and bannertool
+        run: |
+          gh release download -R 3DSGuy/Project_CTR -p '*ubuntu_x86_64*'
+          unzip -o '*ubuntu_x86_64*.zip'
+          chmod +x makerom
+          git clone --recursive https://github.com/CyberYoshi64/bannertool /tmp/bannertool
+          cd /tmp/bannertool
+          docker build -t bannertool-builder .
+          docker run --name bannertool-builder bannertool-builder
+          docker cp bannertool-builder:/bannertool/output/bannertool.zip "$GITHUB_WORKSPACE/bannertool.zip"
+          cd "$GITHUB_WORKSPACE"
+          unzip -o bannertool.zip
+          chmod +x linux-x86_64/bannertool
+
+      - name: Make placeholder banner assets
+        run: |
+          python3 - <<'EOF'
+          import wave, zlib, struct
+          def chunk(t, d):
+              c = struct.pack('>I', len(d)) + t + d
+              return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+          w, h = 256, 128
+          row = b'\x00' + bytes([214, 51, 132]) * w
+          png = (b'\x89PNG\r\n\x1a\n'
+                 + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(row * h))
+                 + chunk(b'IEND', b''))
+          open('banner.png', 'wb').write(png)
+          w = wave.open('silent.wav', 'wb')
+          w.setnchannels(2); w.setsampwidth(2); w.setframerate(22050)
+          w.writeframes(b'\x00' * 22050 * 4 * 3)
+          w.close()
+          EOF
+          ./linux-x86_64/bannertool makebanner -i banner.png -a silent.wav -o banner.bnr
+
+      - name: Build .cia
+        run: |
+          ./makerom -f cia -o yandereschool.cia -elf yandereschool.elf \
+            -rsf app.rsf -target t -exefslogo \
+            -icon yandereschool.smdh -banner banner.bnr
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game
+          path: |
+            yandereschool.cia
+            yandereschool.3dsx
+
+      - name: Publish release (permanent download link)
+        run: |
+          gh release delete latest --cleanup-tag -y || true
+          gh release create latest yandereschool.cia yandereschool.3dsx \
+            --title "Latest build" --notes "Automated build"
